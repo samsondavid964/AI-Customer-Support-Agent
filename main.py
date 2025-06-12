@@ -84,7 +84,10 @@ class TeachProBot:
                 os.getenv('HUMAN_ESCALATION_EMAIL')
             )
             self.llm_service = LLMService(os.getenv('OPENAI_API_KEY'))
-            self.conversation_logger = ConversationLogger(self.sheets_service)
+            self.conversation_logger = ConversationLogger(
+                self.sheets_service,
+                self.supabase
+            )
 
             # Initialize memory services
             self.conversation_memory = ConversationMemory(self.supabase)
