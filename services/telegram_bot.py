@@ -1,30 +1,35 @@
 import asyncio
+import logging
 from datetime import datetime
-from telegram import Update, ChatAction
-from telegram.error import TelegramError
-from telegram.ext import ContextTypes
+from typing import Dict
+
+from telegram import Update
+from telegram.constants import ChatAction
+from telegram.ext import (
+    Application,
+    ApplicationBuilder,
+    ContextTypes,
+    MessageHandler,
+    filters,
+    CommandHandler
+)
 
 class TelegramBot:
-    def __init__(self, telegram_token: str, llm_service: LLMService, vector_store: VectorStore, sheet_service: SheetService):
+    def __init__(self, telegram_token: str, llm_service, vector_store, sheet_service, gmail_service):
         """Initialize the Telegram bot with required services."""
-        # Configure request with longer timeouts and retries
-        request = Request(
-            connection_pool_size=8,
-            connect_timeout=30.0,
-            read_timeout=30.0,
-            write_timeout=30.0
-        )
-        self.bot = Bot(token=telegram_token, request=request)
+        self.token = telegram_token
         self.llm_service = llm_service
         self.vector_store = vector_store
         self.sheet_service = sheet_service
+        self.gmail_service = gmail_service
         self.sessions = {}
         self.logger = logging.getLogger(__name__)
+        self.application = None
 
     async def start_typing(self, chat_id: int):
         """Send typing indicator to the chat."""
         try:
-            await self.bot.send_chat_action(chat_id=chat_id, action=ChatAction.TYPING)
+            await self.application.bot.send_chat_action(chat_id=chat_id, action=ChatAction.TYPING)
         except Exception as e:
             self.logger.error(f"Error sending typing indicator: {str(e)}")
 
@@ -64,13 +69,13 @@ class TelegramBot:
                 )
 
                 # Get relevant context
-                context = await self.get_context(analysis, user_id)
+                context_data = await self.get_context(analysis, user_id)
 
                 # Generate response
                 response = self.llm_service.generate_response(
                     text,
                     self.sessions[user_id]['conversation_history'],
-                    context
+                    context_data
                 )
 
                 # Update conversation history
@@ -150,16 +155,36 @@ class TelegramBot:
             if not message:
                 return
 
+            # Get user information
+            user_info = {
+                'name': f"{message.from_user.first_name} {message.from_user.last_name if message.from_user.last_name else ''}",
+                'username': message.from_user.username,
+                'user_id': message.from_user.id
+            }
+
+            # Get conversation history for this user
+            conversation_history = self.sessions.get(message.from_user.id, {}).get('conversation_history', [])
+
             # Log escalation details
             self.logger.info(f"Escalation required for user {message.from_user.id}")
             self.logger.info(f"Message: {message.text}")
             self.logger.info(f"Analysis: {analysis}")
+
+            # Send escalation email
+            email_sent = self.gmail_service.send_escalation_email(
+                parent_info=user_info,
+                conversation_context=message.text,
+                conversation_history=conversation_history
+            )
 
             # Notify user
             await message.reply_text(
                 "I've noted your request and will ensure it gets the attention it needs. "
                 "A team member will review this and get back to you soon."
             )
+
+            if not email_sent:
+                self.logger.error("Failed to send escalation email")
 
         except Exception as e:
             self.logger.error(f"Error handling escalation: {str(e)}")
@@ -198,31 +223,115 @@ class TelegramBot:
                 'escalation_required': True
             }
 
-    def run(self):
-        """Run the bot."""
+    async def error_handler(self, update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """Handle errors in the bot."""
+        self.logger.error(f"Exception while handling an update: {context.error}")
+        if update and update.effective_message:
+            await update.effective_message.reply_text(
+                "I apologize, but I encountered an error. Please try again in a moment."
+            )
+
+    async def run(self):
+        """Initializes and starts the bot, then runs it indefinitely."""
+        self.logger.info("Starting bot...")
         try:
-            application = Application.builder().token(self.bot.token).build()
+            # Build the application with custom settings
+            self.application = (
+                ApplicationBuilder()
+                .token(self.token)
+                .connect_timeout(30.0)
+                .read_timeout(30.0)
+                .write_timeout(30.0)
+                .pool_timeout(30.0)
+                .build()
+            )
             
             # Add error handler
-            async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
-                self.logger.error(f"Exception while handling an update: {context.error}")
-                if update and update.effective_message:
-                    await update.effective_message.reply_text(
-                        "I apologize, but I encountered an error. Please try again in a moment."
-                    )
+            self.application.add_error_handler(self.error_handler)
             
-            application.add_error_handler(error_handler)
-            application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, self.handle_message))
-            
-            # Run with more resilient polling settings
-            application.run_polling(
-                allowed_updates=Update.ALL_TYPES,
-                drop_pending_updates=True,
-                pool_timeout=30.0,
-                read_timeout=30.0,
-                write_timeout=30.0,
-                connect_timeout=30.0
+            # Add message handler
+            self.application.add_handler(
+                MessageHandler(filters.TEXT & ~filters.COMMAND, self.handle_message)
             )
+
+            # Add test command handler
+            self.application.add_handler(
+                CommandHandler("testemail", self.test_email)
+            )
+            
+            # Initialize the application
+            await self.application.initialize()
+            
+            # Start the polling process in the background
+            await self.application.start()
+            
+            # Start polling without blocking the main event loop
+            await self.application.updater.start_polling(
+                allowed_updates=Update.ALL_TYPES,
+                drop_pending_updates=True
+            )
+            
+            self.logger.info("Bot is running. Press Ctrl+C to stop.")
+
+            # Keep the main coroutine alive
+            while True:
+                await asyncio.sleep(3600)  # Sleep for an hour
+
         except Exception as e:
             self.logger.error(f"Error running bot: {str(e)}")
-            raise 
+            raise
+        finally:
+            # Ensure proper shutdown if the loop is ever broken
+            if self.application and self.application.updater.is_running:
+                await self.application.updater.stop()
+            if self.application:
+                await self.application.stop()
+                await self.application.shutdown()
+            self.logger.info("Bot has been shut down.")
+
+    async def test_email(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Test the email functionality."""
+        try:
+            message = update.message
+            if not message:
+                return
+
+            # Get user information
+            user_info = {
+                'name': f"{message.from_user.first_name} {message.from_user.last_name if message.from_user.last_name else ''}",
+                'username': message.from_user.username,
+                'user_id': message.from_user.id
+            }
+
+            # Send a test notification email
+            email_sent = self.gmail_service.send_notification_email(
+                subject="Test Email from TeachPro Bot",
+                body=f"""
+This is a test email from the TeachPro Bot.
+
+User Information:
+• Name: {user_info['name']}
+• Username: @{user_info['username']}
+• User ID: {user_info['user_id']}
+
+Time: {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}
+
+If you're receiving this email, the email functionality is working correctly!
+                """,
+                recipient=self.gmail_service.escalation_email
+            )
+
+            if email_sent:
+                await message.reply_text(
+                    "✅ Test email sent successfully! Please check the escalation email inbox."
+                )
+            else:
+                await message.reply_text(
+                    "❌ Failed to send test email. Please check the logs for more information."
+                )
+
+        except Exception as e:
+            self.logger.error(f"Error in test_email command: {str(e)}")
+            await message.reply_text(
+                "❌ An error occurred while testing the email functionality. Please check the logs."
+            ) 
